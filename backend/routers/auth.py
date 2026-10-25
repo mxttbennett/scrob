@@ -10,7 +10,8 @@ from sqlalchemy.future import select
 from sqlalchemy import delete, func, or_, and_
 from datetime import datetime, timedelta, timezone
 from typing import Optional
-from jose import jwt, JWTError
+import jwt
+from jwt import PyJWTError
 
 from db import get_db
 from models.base import UserRole
@@ -40,6 +41,7 @@ import schemas
 from dependencies import get_current_user, oauth2_scheme, DEVICE_TOKEN_TYPE
 from sqlalchemy.orm import selectinload
 from fastapi import File, UploadFile
+from core.timeutil import utcnow
 
 logger = logging.getLogger(__name__)
 
@@ -164,6 +166,19 @@ async def reset_password(
     return {"message": "Password updated successfully."}
 
 
+async def _find_user_for_login(db: AsyncSession, typed: str) -> User | None:
+    """Resolve the username typed on the login form (#427). Surrounding spaces
+    (mobile keyboard autocomplete) are ignored and case doesn't matter, unless
+    two accounts differ only by case - an exact match always wins, and an
+    ambiguous case-insensitive match finds nobody rather than guessing."""
+    typed = typed.strip()
+    exact = (await db.execute(select(User).where(User.username == typed))).scalar_one_or_none()
+    if exact:
+        return exact
+    loose = (await db.execute(select(User).where(func.lower(User.username) == typed.lower()).limit(2))).scalars().all()
+    return loose[0] if len(loose) == 1 else None
+
+
 @router.post("/register", response_model=schemas.User)
 @limiter.limit("10/minute")
 async def register(request: Request, user_in: schemas.UserCreate, db: AsyncSession = Depends(get_db)):
@@ -173,7 +188,9 @@ async def register(request: Request, user_in: schemas.UserCreate, db: AsyncSessi
             detail="Registrations are disabled.",
         )
 
-    query = select(User).where((User.email == user_in.email) | (User.username == user_in.username))
+    query = select(User).where(
+        (User.email == user_in.email) | (func.lower(User.username) == user_in.username.strip().lower())
+    )
     result = await db.execute(query)
     if result.scalar_one_or_none():
         raise HTTPException(
@@ -187,7 +204,7 @@ async def register(request: Request, user_in: schemas.UserCreate, db: AsyncSessi
     email_confirmed = not app_settings.require_email_validation
     new_user = User(
         email=user_in.email,
-        username=user_in.username,
+        username=user_in.username.strip(),
         password_hash=get_password_hash(user_in.password),
         api_key=_generate_api_key(),
         # Never take the role from the request body: role == "admin" grants
@@ -238,9 +255,7 @@ async def login(
             detail="Password login is disabled. Please use SSO.",
         )
 
-    query = select(User).where(User.username == form_data.username)
-    result = await db.execute(query)
-    user = result.scalar_one_or_none()
+    user = await _find_user_for_login(db, form_data.username)
 
     if not user or not user.password_hash or not verify_password(form_data.password, user.password_hash):
         raise HTTPException(
@@ -390,7 +405,7 @@ async def renew_session(
 ):
     try:
         payload = jwt.decode(token, app_settings.secret_key, algorithms=[ALGORITHM])
-    except JWTError:
+    except PyJWTError:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Could not validate credentials")
     # Only plain login tokens slide; typed ones (device grants, 2FA) never do.
     if payload.get("type"):
@@ -1665,7 +1680,7 @@ async def verify_2fa_login(
             raise credentials_exception
         user_id = int(payload["sub"])
         remember = bool(payload.get("remember"))
-    except (JWTError, ValueError, KeyError):
+    except (PyJWTError, ValueError, KeyError):
         raise credentials_exception
     lifetime = session_lifetime(remember)
 
@@ -1716,7 +1731,7 @@ async def verify_2fa_login(
 # Connected Apps. The resulting token is scope-limited - dependencies.py
 # rejects it on every account/security endpoint (see DEVICE_TOKEN_TYPE).
 #
-# All timestamps here are naive UTC (datetime.utcnow), matching the
+# All timestamps here are naive UTC (utcnow), matching the
 # oauth_device_grants columns, so comparisons never mix aware/naive.
 
 DEVICE_CODE_TTL = timedelta(minutes=15)
@@ -1789,7 +1804,7 @@ async def device_code(
         raise HTTPException(status_code=400, detail="Unsupported scope")
     client_name = (body.client_name or "").strip()[:120] or "Unknown app"
 
-    now = datetime.utcnow()
+    now = utcnow()
     # Opportunistic housekeeping so the table doesn't accumulate dead rows.
     await db.execute(
         delete(OAuthDeviceGrant).where(
@@ -1863,7 +1878,7 @@ async def _device_token_exchange(db: AsyncSession, device_code_raw: str) -> JSON
     if grant is None:
         return _oauth_error("invalid_grant")
 
-    now = datetime.utcnow()
+    now = utcnow()
 
     # The device_code is single-use: once tokens have been minted the client
     # must use its refresh token.
@@ -1924,14 +1939,14 @@ async def _device_token_refresh(db: AsyncSession, refresh_raw: str) -> JSONRespo
         )
         stolen = replay.scalar_one_or_none()
         if stolen is not None and stolen.revoked_at is None:
-            stolen.revoked_at = datetime.utcnow()
+            stolen.revoked_at = utcnow()
             await db.commit()
         return _oauth_error("invalid_grant")
 
     if grant.revoked_at is not None or grant.status != "approved":
         return _oauth_error("invalid_grant")
 
-    now = datetime.utcnow()
+    now = utcnow()
     new_refresh = generate_opaque_token()
     grant.prev_refresh_token_hash = grant.refresh_token_hash
     grant.refresh_token_hash = hash_opaque_token(new_refresh)
@@ -1949,7 +1964,7 @@ async def _load_pending_grant(db: AsyncSession, user_code: str) -> OAuthDeviceGr
         raise HTTPException(status_code=404, detail="Unknown or expired code")
     result = await db.execute(select(OAuthDeviceGrant).where(OAuthDeviceGrant.user_code == code))
     grant = result.scalar_one_or_none()
-    if grant is None or grant.status != "pending" or datetime.utcnow() >= grant.expires_at:
+    if grant is None or grant.status != "pending" or utcnow() >= grant.expires_at:
         raise HTTPException(status_code=404, detail="Unknown or expired code")
     return grant
 
@@ -1989,7 +2004,7 @@ async def device_approve(
     grant.user_id = current_user.id
     if action == "approve":
         grant.status = "approved"
-        grant.approved_at = datetime.utcnow()
+        grant.approved_at = utcnow()
         chosen_name = (body.name or "").strip()[:120]
         if chosen_name:
             grant.client_name = chosen_name
@@ -2032,6 +2047,6 @@ async def revoke_device_grant(
     if grant is None:
         raise HTTPException(status_code=404, detail="Not found")
     if grant.revoked_at is None:
-        grant.revoked_at = datetime.utcnow()
+        grant.revoked_at = utcnow()
         await db.commit()
     return {"status": "revoked"}

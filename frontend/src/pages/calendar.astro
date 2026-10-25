@@ -1,5 +1,6 @@
 ---
 import Base from "../layouts/Base.astro";
+import FilterPanel from "../components/FilterPanel.astro";
 import { api, tmdbImageUrl, type CalendarEntry } from "../lib/api";
 import { ratingPosterUrl } from "../lib/posters";
 export const prerender = false;
@@ -14,18 +15,38 @@ Astro.response.headers.set("Cache-Control", "no-store");
 // a client script fills in after the fact. `cached: false` only happens for
 // a genuinely cold cache (first-ever visit, or >48h since the last load) -
 // that's the one case actually worth a client-side wait.
+// How far ahead to look (#467), remembered in a cookie so it survives reloads
+// and the server render can use it.
+const CALENDAR_DAY_CHOICES = [14, 30, 60, 90];
+const savedDays = Number(Astro.cookies.get("calendar_days")?.value);
+const lookaheadDays = CALENDAR_DAY_CHOICES.includes(savedDays) ? savedDays : 14;
+
+// Filters live in the URL like the other pages' FilterPanel. The Sonarr ones
+// are applied by the backend; Collected/Watched are applied below since each
+// entry already carries those flags.
+const arr = Astro.url.searchParams.getAll("arr");
+const collection = Astro.url.searchParams.get("collection") ?? "";
+const watch = Astro.url.searchParams.get("watch") ?? "";
+const sonarrOnly = arr.includes("in");
+const sonarrMonitored = arr.includes("monitored");
+
 let calendarData: Awaited<ReturnType<typeof api.calendar.get>> | null = null;
 let loadError = "";
 try {
-  calendarData = await api.calendar.get(token, true);
+  calendarData = await api.calendar.get(token, true, lookaheadDays, sonarrOnly, sonarrMonitored);
 } catch (e: any) {
   loadError = e.message;
 }
 
 // Only actually "needs" a client-side wait when there's no load error to
 // show instead - an error should never trigger the poll-and-reload loop.
+const sonarrConfigured = calendarData?.sonarr_configured ?? false;
 const needsCompute = !loadError && !calendarData?.cached;
-const entries = calendarData?.calendar?.entries ?? [];
+const entries = (calendarData?.calendar?.entries ?? []).filter((e) =>
+  (collection === "in" ? e.collected : collection === "out" ? !e.collected : true) &&
+  (watch === "watched" ? e.watched : watch === "unwatched" ? !e.watched : true)
+);
+const hasFilters = !!(arr.length || collection || watch);
 const todayIso = calendarData?.calendar?.today ?? new Date().toISOString().slice(0, 10);
 
 function dayLabel(iso: string, today: string): string {
@@ -55,8 +76,32 @@ const days = Object.keys(byDay);
 ---
 
 <Base title="Calendar">
-  <div class="mb-8 flex items-center justify-between gap-4">
+  <div class="mb-8 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4">
     <h1 class="page-title">Calendar</h1>
+    <div class="flex flex-wrap items-center gap-2 sm:shrink-0">
+    <select
+      id="cal-days-select"
+      aria-label="How far ahead to show"
+      class="px-3 py-2 text-sm font-bold text-zinc-400 bg-zinc-900 border border-zinc-800 rounded-xl hover:border-zinc-600 transition-all cursor-pointer"
+    >
+      {CALENDAR_DAY_CHOICES.map((d) => (
+        <option value={d} selected={d === lookaheadDays}>Next {d} days</option>
+      ))}
+    </select>
+    <FilterPanel
+      id="calendar-filters"
+      basePath="/calendar"
+      sections={[
+        ...(sonarrConfigured ? [{
+          key: "arr", label: "Sonarr", selected: arr,
+          options: [{ value: "in", label: "In Sonarr" }, { value: "monitored", label: "Monitored" }],
+        }] : []),
+        { key: "collection", label: "Collection", multi: false, selected: collection ? [collection] : [],
+          options: [{ value: "in", label: "Collected" }, { value: "out", label: "Not Collected" }] },
+        { key: "watch", label: "Watched", multi: false, selected: watch ? [watch] : [],
+          options: [{ value: "watched", label: "Watched" }, { value: "unwatched", label: "Unwatched" }] },
+      ]}
+    />
     <button
       id="cal-refresh-btn"
       class="flex items-center gap-2 px-4 py-2 text-sm font-bold text-zinc-400 bg-zinc-900 border border-zinc-800 rounded-xl hover:border-zinc-600 hover:text-zinc-200 transition-all cursor-pointer shrink-0"
@@ -67,6 +112,7 @@ const days = Object.keys(byDay);
       </svg>
       <span>Refresh</span>
     </button>
+    </div>
   </div>
 
   {loadError ? (
@@ -74,7 +120,7 @@ const days = Object.keys(byDay);
   ) : needsCompute ? (
     <div id="cal-pending" class="py-20 text-center text-zinc-500">Checking air dates for your shows… (first time can take a minute)</div>
   ) : days.length === 0 ? (
-    <p class="text-zinc-500 text-center py-10">No episodes found for your shows in the last 7 or next 14 days.</p>
+    <p class="text-zinc-500 text-center py-10">{hasFilters ? "No episodes match these filters." : `No episodes found for your shows in the last 7 or next ${lookaheadDays} days.`}</p>
   ) : (
     <div class="space-y-8">
       {days.map((day) => (
@@ -116,12 +162,17 @@ const days = Object.keys(byDay);
     </div>
   )}
 
-  <p class="text-zinc-500 mt-8">The last 7 days and next 14 days for shows you're collecting or watching</p>
+  <p class="text-zinc-500 mt-8">The last 7 days and next {lookaheadDays} days for shows you're collecting or watching</p>
 </Base>
 
 <script define:vars={{ token, needsCompute }}>
   const refreshBtn = document.getElementById('cal-refresh-btn');
   const refreshIcon = document.getElementById('cal-refresh-icon');
+
+  document.getElementById('cal-days-select')?.addEventListener('change', (e) => {
+    document.cookie = `calendar_days=${e.target.value}; path=/; max-age=31536000; samesite=lax`;
+    window.location.reload();
+  });
 
   refreshBtn?.addEventListener('click', async () => {
     refreshIcon?.classList.add('animate-spin');

@@ -36,6 +36,7 @@ from models.sync import SyncJob, SyncStatus
 from models.users import User, UserSettings
 from models.global_settings import GlobalSettings
 from sqlalchemy.orm.attributes import flag_modified
+from core.timeutil import utcnow
 
 logger = logging.getLogger(__name__)
 
@@ -443,7 +444,7 @@ async def _get_or_create_person_media(db: AsyncSession, tmdb_id: int, name: str,
 
 def _trakt_rated_at(value: str | None) -> datetime:
     if not value:
-        return datetime.utcnow()
+        return utcnow()
     from dateutil import parser as dt_parser
 
     parsed = dt_parser.isoparse(value)
@@ -607,6 +608,19 @@ class ExportTraktSource:
         return self.data.comments
 
 
+_UNIMPORTED_CAP = 200
+
+
+def _note_unimported(stats: dict, label: str, reason: str) -> None:
+    """Remember an item the import couldn't bring in (as opposed to one it
+    skipped because it was already there), so the job summary can list them (#454)."""
+    items = stats.setdefault("unimported", [])
+    if len(items) < _UNIMPORTED_CAP:
+        items.append(f"{label} ({reason})")
+    else:
+        stats["unimported_more"] = stats.get("unimported_more", 0) + 1
+
+
 async def _apply_trakt_import(
     db: AsyncSession,
     job_id: int,
@@ -680,12 +694,14 @@ async def _apply_trakt_import(
             try:
                 if not tmdb_id:
                     stats["skipped"] += 1
+                    _note_unimported(stats, f'movie "{movie_data.get("title", "?")}"', "no TMDB id")
                     continue
                 try:
                     async with db.begin_nested():
                         media = await _get_or_create_movie_media(db, tmdb_id, movie_data.get("title", ""), api_key)
                         if not media:
                             stats["errors"] += 1
+                            _note_unimported(stats, f'movie "{movie_data.get("title", "?")}"', f"tmdb:{tmdb_id} not found")
                             continue
                         # A dateless play (submitted with watched_at="unknown", which Trakt
                         # silently stores/returns as the Unix epoch — see
@@ -701,7 +717,7 @@ async def _apply_trakt_import(
                                 completed=True,
                                 play_count=1,
                             ))
-                            existing_times.setdefault(media.id, []).append(watched_at or datetime.utcnow())
+                            existing_times.setdefault(media.id, []).append(watched_at or utcnow())
                             _new_watched.add(media.id)
                             stats["movies"] += 1
                         else:
@@ -751,6 +767,7 @@ async def _apply_trakt_import(
                 plays_by_show.setdefault(show_tmdb_id, []).append(entry)
             else:
                 stats["skipped"] += 1
+                _note_unimported(stats, f'show "{entry.get("show", {}).get("title", "?")}"', "no TMDB id")
 
         async def process_show(show_tmdb_id: int, entries: list[dict]):
             show_title = entries[0].get("show", {}).get("title", "")
@@ -759,6 +776,7 @@ async def _apply_trakt_import(
                     show = await _get_or_create_show(db, show_tmdb_id, show_title, api_key)
                     if not show:
                         stats["errors"] += 1
+                        _note_unimported(stats, f'show "{show_title}"', f"tmdb:{show_tmdb_id} not found")
                         return
                     await db.flush()
 
@@ -768,6 +786,7 @@ async def _apply_trakt_import(
                     ep_num = ep_data.get("number")
                     if season_num is None or ep_num is None:
                         stats["skipped"] += 1
+                        _note_unimported(stats, f'show "{show_title}" episode', "no season/episode number")
                         continue
                     try:
                         async with db.begin_nested():
@@ -776,6 +795,7 @@ async def _apply_trakt_import(
                             )
                             if not media:
                                 stats["errors"] += 1
+                                _note_unimported(stats, f'show "{show_title}" S{season_num}E{ep_num}', "episode not found on TMDB")
                                 continue
                             # See the movie-import branch above: preserve an unknown
                             # date as unknown rather than fabricating "now".
@@ -792,7 +812,7 @@ async def _apply_trakt_import(
                                 db.add(event)
                                 await db.flush()
                                 await record_rewatch_progress(db, user_id, media.id, event.id)
-                                existing_times.setdefault(media.id, []).append(watched_at or datetime.utcnow())
+                                existing_times.setdefault(media.id, []).append(watched_at or utcnow())
                                 _new_watched.add(media.id)
                                 stats["episodes"] += 1
                             else:
@@ -1178,6 +1198,14 @@ async def _apply_trakt_import(
 
 
 def _trakt_import_summary(job_id: int, label: str, stats: dict) -> str:
+    unimported = stats.get("unimported") or []
+    if unimported:
+        more = stats.get("unimported_more", 0)
+        logger.warning(
+            "Trakt %s job %s could not import %d item(s): %s%s",
+            label, job_id, len(unimported) + more, "; ".join(unimported),
+            f" (+{more} more)" if more else "",
+        )
     return (
         f"Trakt {label} job {job_id} completed. "
         f"Movies: {stats['movies']} new, {stats.get('skipped', 0)} skipped. "
@@ -1414,7 +1442,7 @@ async def _apply_trakt_comments_import(
                 episode_number=episode_number,
                 content=content,
                 is_spoiler=bool(comment.get("spoiler")),
-                created_at=_parse_trakt_datetime(comment.get("created_at")) or datetime.utcnow(),
+                created_at=_parse_trakt_datetime(comment.get("created_at")) or utcnow(),
             ))
             existing_keys.add(key)
             stats["comments"] = stats.get("comments", 0) + 1
