@@ -212,6 +212,20 @@ class StremioSyncTests(unittest.IsolatedAsyncioTestCase):
         # Assert
         self.assertEqual(failed_ids, {"tt0487831"})
 
+    async def test_series_without_an_imdb_id_logs_that_its_watch_state_was_skipped(self) -> None:
+        # Arrange
+        item = {
+            "_id": "tmdb:2490",
+            "type": "series",
+            "name": "The IT Crowd",
+            "state": {"video_id": "tmdb:2490:1:1", "lastWatched": "2026-07-26T12:00:00Z"},
+        }
+
+        # Act & Assert
+        with self.assertLogs(level="WARNING") as logs:
+            await _stremio_records([item])
+        self.assertTrue(any("has no IMDb id" in line for line in logs.output))
+
     async def test_unresolved_ids_cover_missing_tmdb_match_and_missing_show(self) -> None:
         # Arrange
         records = [
