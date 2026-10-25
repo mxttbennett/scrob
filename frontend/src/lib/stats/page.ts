@@ -18,6 +18,7 @@ async function loadStats(since, until) {
     if (since) params.set('since', since);
     if (until) params.set('until', until);
     const qs = params.toString();
+    document.querySelectorAll('[data-list-link]').forEach(a => { a.href = a.dataset.listLink + (qs ? '?' + qs : ''); });
     const res = await fetch(`/api/proxy/profile/${userId}/stats${qs ? '?' + qs : ''}`, {
       headers: token ? { Authorization: `Bearer ${token}` } : {},
     });

@@ -1,4 +1,3 @@
-from collections import defaultdict
 from fastapi import APIRouter, Depends
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
@@ -16,6 +15,7 @@ from models.ratings import Rating
 from models.show import Show as ShowModel
 
 from .common import _check_profile_access
+from .top_media import _effective_runtime, _top_media, _watch_date_filters
 
 
 router = APIRouter()
@@ -32,11 +32,7 @@ async def get_user_stats(
     await _check_profile_access(user_id, current_user, db)
 
     # Date range filters applied to all WatchEvent queries
-    date_filters = [WatchEvent.completed == True]
-    if since:
-        date_filters.append(WatchEvent.watched_at >= since)
-    if until:
-        date_filters.append(WatchEvent.watched_at < until + TimeDelta(days=1))
+    date_filters = _watch_date_filters(since, until)
     # Additional filter for anything bucketed/grouped by watched_at (activity charts,
     # weekday distribution, weeks-active count) — an unknown-dated event can't be
     # placed on a timeline, so it's excluded there while still counting in plain totals.
@@ -72,15 +68,7 @@ async def get_user_stats(
     )
     shows_watched = shows_q.scalar_one()
 
-    from sqlalchemy import Integer as SAInteger
-    from sqlalchemy.types import Text as SAText
-    # Episodes store runtime in tmdb_data['runtime']; movies use Media.runtime.
-    # JSON (non-JSONB) has no .astext; cast to Text first, guard against JSON "null".
-    json_runtime = func.cast(
-        func.nullif(func.cast(Media.tmdb_data["runtime"], SAText), "null"),
-        SAInteger,
-    )
-    effective_runtime = func.coalesce(Media.runtime, json_runtime)
+    effective_runtime = _effective_runtime()
     watch_time_q = await db.execute(
         select(func.coalesce(func.sum(effective_runtime), 0))
         .join(WatchEvent, WatchEvent.media_id == Media.id)
@@ -317,54 +305,7 @@ async def get_user_stats(
     if current_user and current_user.id == user_id:
         await maybe_backfill_credits(db, user_id)
 
-    top_rows = (await db.execute(
-        select(
-            Media.media_type, Media.id, Media.title, Media.poster_path,
-            Media.tmdb_id, Media.show_id, effective_runtime.label("runtime"),
-        )
-        .join(WatchEvent, WatchEvent.media_id == Media.id)
-        .where(
-            WatchEvent.user_id == user_id,
-            Media.media_type.in_(["movie", "episode"]),
-            *date_filters,
-        )
-    )).all()
-
-    per_show: dict[int, dict] = defaultdict(lambda: {"plays": 0, "minutes": 0, "episodes": set()})
-    per_movie: dict[int, dict] = {}
-    for media_type, mid, m_title, m_poster, m_tmdb_id, show_id, runtime in top_rows:
-        minutes = runtime or 0
-        if media_type == "episode" and show_id:
-            s = per_show[show_id]
-            s["plays"] += 1
-            s["minutes"] += minutes
-            s["episodes"].add(mid)
-        elif media_type == "movie":
-            m = per_movie.setdefault(mid, {
-                "title": m_title, "poster_path": m_poster, "tmdb_id": m_tmdb_id,
-                "plays": 0, "minutes": 0,
-            })
-            m["plays"] += 1
-            m["minutes"] += minutes
-
-    show_meta: dict[int, dict] = {}
-    if per_show:
-        top_show_rows = (await db.execute(
-            select(ShowModel).where(ShowModel.id.in_(per_show.keys()))
-        )).scalars().all()
-        for sh in top_show_rows:
-            show_meta[sh.id] = {
-                "title": sh.title, "poster_path": sh.poster_path,
-                "tmdb_id": sh.tmdb_id, "tvdb_id": sh.tvdb_id,
-            }
-
-    top_shows = sorted(
-        ({**show_meta.get(sid, {"title": None, "poster_path": None, "tmdb_id": None, "tvdb_id": None}),
-          "plays": s["plays"], "minutes": s["minutes"], "episodes": len(s["episodes"])}
-         for sid, s in per_show.items()),
-        key=lambda x: (x["plays"], x["minutes"]), reverse=True,
-    )[:12]
-    top_movies = sorted(per_movie.values(), key=lambda x: (x["plays"], x["minutes"]), reverse=True)[:12]
+    top_shows, top_movies = await _top_media(db, user_id, date_filters)
     # Networks come from the same instance-wide TMDB credits cache as the people
     # stats below (core/credits.py) - it already fetches a full show response per
     # watched title, so this reuses that instead of relying on Show.tmdb_data
@@ -398,8 +339,8 @@ async def get_user_stats(
         "shows_watched_collected": shows_watched_collected,
         "shows_unwatched_collected": max(shows_collected - shows_watched_collected, 0),
         # Top titles & people (#124)
-        "top_shows": top_shows,
-        "top_movies": top_movies,
+        "top_shows": top_shows[:12],
+        "top_movies": top_movies[:12],
         "top_networks": top_networks,
         "top_people": top_people,
     }
