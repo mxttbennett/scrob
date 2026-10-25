@@ -22,8 +22,9 @@ from routers.sync import (
     _pull_stremio_items,
     _push_stremio_connection,
     _stremio_records,
+    _stremio_unresolved_ids,
     _stremio_same_item,
-    _stremio_sorted_videos,
+    _stremio_videos,
 )
 
 
@@ -105,6 +106,15 @@ class StremioBitfieldTests(unittest.TestCase):
         )
 
 
+    def test_bitfield_with_missing_anchor_logs_warning(self) -> None:
+        # Arrange
+        serialized = stremio.encode_watched_bitfield({"tt1234567:1:1"}, ["tt1234567:1:1"])
+
+        # Act & Assert
+        with self.assertLogs("core.stremio", level="WARNING"):
+            self.assertEqual(stremio.decode_watched_bitfield(serialized, ["tt1234567:1:2"]), set())
+
+
 class StremioSyncTests(unittest.IsolatedAsyncioTestCase):
     async def test_incremental_pull_consumes_datastore_meta_tuples(self) -> None:
         cursor = datetime.now(timezone.utc).replace(tzinfo=None)
@@ -114,6 +124,7 @@ class StremioSyncTests(unittest.IsolatedAsyncioTestCase):
             token="auth-key",
             stremio_full_sync_done=True,
             stremio_pull_cursor_at=cursor,
+            stremio_pending_pull_ids=[],
         )
 
         with (
@@ -138,16 +149,83 @@ class StremioSyncTests(unittest.IsolatedAsyncioTestCase):
         self.assertGreaterEqual(started_at, cursor)
         datastore_get.assert_awaited_once_with("auth-key", ids=["tt-recent"])
 
+    async def test_incremental_pull_refetches_pending_retry_ids(self) -> None:
+        # Arrange
+        cursor = datetime.now(timezone.utc).replace(tzinfo=None)
+        connection = SimpleNamespace(
+            token="auth-key",
+            stremio_full_sync_done=True,
+            stremio_pull_cursor_at=cursor,
+            stremio_pending_pull_ids=["tt-failed"],
+        )
+
+        with (
+            patch.object(stremio, "datastore_meta", AsyncMock(return_value=[])),
+            patch.object(
+                stremio,
+                "datastore_get",
+                AsyncMock(return_value=[{"_id": "tt-failed"}]),
+            ) as datastore_get,
+        ):
+            # Act
+            items, complete_snapshot, _ = await _pull_stremio_items(
+                connection,
+                full_resync=False,
+            )
+
+        # Assert
+        self.assertEqual(items, [{"_id": "tt-failed"}])
+        self.assertFalse(complete_snapshot)
+        datastore_get.assert_awaited_once_with("auth-key", ids=["tt-failed"])
+
+    async def test_series_whose_cinemeta_lookup_fails_is_reported_for_retry(self) -> None:
+        # Arrange
+        item = {
+            "_id": "tt0487831",
+            "type": "series",
+            "name": "The IT Crowd",
+            "state": {"video_id": "tt0487831:1:1", "lastWatched": "2026-07-26T12:00:00Z"},
+        }
+        failed_ids: set[str] = set()
+
+        with patch.object(
+            stremio,
+            "get_cinemeta_series",
+            AsyncMock(side_effect=stremio.StremioAPIError("Cinemeta unavailable")),
+        ):
+            # Act
+            await _stremio_records([item], failed_ids=failed_ids)
+
+        # Assert
+        self.assertEqual(failed_ids, {"tt0487831"})
+
+    async def test_unresolved_ids_cover_missing_tmdb_match_and_missing_show(self) -> None:
+        # Arrange
+        records = [
+            {"content_id": "tt-no-match", "content_type": "movie"},
+            {"content_id": "tt-no-show", "content_type": "series"},
+            {"content_id": "tt-resolved", "content_type": "series"},
+            {"content_id": "tmdb:42", "content_type": "movie"},
+        ]
+        tmdb_ids = {"tt-no-show": 1, "tt-resolved": 2, "tmdb:42": 42}
+        show_map = {"tt-resolved": 7}
+
+        # Act
+        unresolved = _stremio_unresolved_ids(records, tmdb_ids, show_map)
+
+        # Assert
+        self.assertEqual(unresolved, {"tt-no-match", "tt-no-show"})
+
     async def test_series_records_use_cinemeta_episode_order_and_progress(self) -> None:
         videos = [
             {"id": "tt0944947:2:1", "season": 2, "episode": 1, "name": "S2E1"},
             {"id": "tt0944947:1:2", "season": 1, "episode": 2, "name": "S1E2"},
             {"id": "tt0944947:1:1", "season": 1, "episode": 1, "name": "S1E1"},
         ]
-        sorted_ids = [video["id"] for video in _stremio_sorted_videos({"videos": videos})]
+        video_ids = [video["id"] for video in _stremio_videos({"videos": videos})]
         watched = stremio.encode_watched_bitfield(
             {"tt0944947:1:1", "tt0944947:2:1"},
-            sorted_ids,
+            video_ids,
         )
         item = {
             "_id": "tt0944947",
@@ -177,6 +255,38 @@ class StremioSyncTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((progress[0]["season"], progress[0]["episode"]), (1, 2))
         self.assertEqual(progress[0]["position"], 120_000)
         self.assertEqual(removed, set())
+
+    async def test_series_watched_bitfield_decodes_in_cinemeta_order_when_special_is_last_watched(self) -> None:
+        # Arrange
+        videos = [
+            {"id": "tt0487831:1:1", "season": 1, "episode": 1, "name": "S1E1"},
+            {"id": "tt0487831:1:2", "season": 1, "episode": 2, "name": "S1E2"},
+            {"id": "tt0487831:0:1", "season": 0, "episode": 1, "name": "S0E1"},
+        ]
+        watched = stremio.encode_watched_bitfield(
+            {"tt0487831:1:1", "tt0487831:1:2", "tt0487831:0:1"},
+            [video["id"] for video in videos],
+        )
+        item = {
+            "_id": "tt0487831",
+            "type": "series",
+            "name": "The IT Crowd",
+            "state": {"watched": watched, "lastWatched": "2026-07-26T12:00:00Z"},
+        }
+
+        with patch.object(
+            stremio,
+            "get_cinemeta_series",
+            AsyncMock(return_value={"videos": videos}),
+        ):
+            # Act
+            _, watched_records, _, _ = await _stremio_records([item])
+
+        # Assert
+        self.assertEqual(
+            {(record["season"], record["episode"]) for record in watched_records},
+            {(1, 1), (1, 2), (0, 1)},
+        )
 
     async def test_temporary_removed_movie_still_emits_watched_state(self) -> None:
         item = {

@@ -1,10 +1,12 @@
 import base64
+import logging
 import zlib
 from typing import Any
 
 import httpx
 
 
+logger = logging.getLogger(__name__)
 DEFAULT_URL = "https://api.strem.io"
 API_URL = f"{DEFAULT_URL}/api"
 LINK_URL = "https://link.stremio.com/api/v2"
@@ -178,10 +180,18 @@ def decode_watched_bitfield(serialized: str | None, video_ids: list[str]) -> set
     try:
         anchor_video_id, anchor_length_raw, packed = serialized.rsplit(":", 2)
         anchor_length = int(anchor_length_raw)
-        anchor_index = video_ids.index(anchor_video_id)
         previous = zlib.decompress(base64.b64decode(packed))
     except (ValueError, TypeError, zlib.error, base64.binascii.Error):
+        logger.warning("Stremio watched bitfield is malformed; ignoring it")
         return set()
+    if anchor_video_id not in video_ids:
+        logger.warning(
+            "Stremio watched bitfield anchor %s is not among the %d current videos; ignoring it",
+            anchor_video_id,
+            len(video_ids),
+        )
+        return set()
+    anchor_index = video_ids.index(anchor_video_id)
     if anchor_length <= 0:
         return set()
 
