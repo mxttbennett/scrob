@@ -114,6 +114,19 @@ class StremioBitfieldTests(unittest.TestCase):
         with self.assertLogs("core.stremio", level="WARNING"):
             self.assertEqual(stremio.decode_watched_bitfield(serialized, ["tt1234567:1:2"]), set())
 
+    def test_bitfield_anchor_matches_by_season_and_episode_when_addon_ids_differ(self) -> None:
+        # Arrange
+        video_ids = ["tt1234567:1:1", "tt1234567:1:2", "tt1234567:2:1"]
+        serialized = stremio.encode_watched_bitfield({"tt1234567:1:1", "tt1234567:1:2"}, video_ids)
+        _, anchor_length, packed = serialized.rsplit(":", 2)
+        addon_serialized = f"tmdb:999:1:2:{anchor_length}:{packed}"
+
+        # Act
+        watched = stremio.decode_watched_bitfield(addon_serialized, video_ids)
+
+        # Assert
+        self.assertEqual(watched, {"tt1234567:1:1", "tt1234567:1:2"})
+
 
 class StremioSyncTests(unittest.IsolatedAsyncioTestCase):
     async def test_incremental_pull_consumes_datastore_meta_tuples(self) -> None:
