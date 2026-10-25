@@ -5102,9 +5102,25 @@ def _stremio_series_imdb_id(item: dict) -> str | None:
     return None
 
 
+def _stremio_unresolved_ids(
+    records: list[dict],
+    tmdb_ids: dict[str, int],
+    show_map: dict[str, int],
+) -> set[str]:
+    unresolved: set[str] = set()
+    for record in records:
+        content_id = str(record.get("content_id") or "")
+        if content_id not in tmdb_ids:
+            unresolved.add(content_id)
+        elif record.get("content_type") == "series" and content_id not in show_map:
+            unresolved.add(content_id)
+    return unresolved
+
+
 async def _stremio_records(
     items: list[dict],
     scrobble_threshold: float = 0.75,
+    failed_ids: set[str] | None = None,
 ) -> tuple[list[dict], list[dict], list[dict], set[str]]:
     records = [
         item
@@ -5131,7 +5147,17 @@ async def _stremio_records(
         for item in series_needing_meta
         if (imdb_id := _stremio_series_imdb_id(item)) is not None
     }
+    for item in series_needing_meta:
+        if str(item["_id"]) not in series_imdb_ids:
+            logger.warning(
+                "Stremio series %s has no IMDb id, so its watch state was skipped",
+                item["_id"],
+            )
     metas = await _stremio_series_metadata(set(series_imdb_ids.values()))
+    if failed_ids is not None:
+        failed_ids.update(
+            content_id for content_id, imdb_id in series_imdb_ids.items() if imdb_id not in metas
+        )
 
     library_records: list[dict] = []
     watched_records: list[dict] = []
@@ -5174,7 +5200,7 @@ async def _stremio_records(
                 )
             continue
 
-        videos = _stremio_sorted_videos(metas.get(series_imdb_ids.get(content_id, content_id), {}))
+        videos = _stremio_videos(metas.get(series_imdb_ids.get(content_id, content_id), {}))
         video_ids = [str(video["id"]) for video in videos]
         watched_ids = stremio.decode_watched_bitfield(state.get("watched"), video_ids)
         for video in videos:
@@ -5300,6 +5326,10 @@ async def _pull_stremio_items(
         modified_at = _nuvio_datetime(_stremio_epoch_ms(row[1]))
         if item_id and modified_at is not None and modified_at >= cutoff:
             changed_ids.append(item_id)
+    pending_ids = list(conn.stremio_pending_pull_ids or [])
+    if pending_ids:
+        logger.info("Retrying %d Stremio items that failed in the previous sync", len(pending_ids))
+    changed_ids = list(dict.fromkeys([*changed_ids, *pending_ids]))
     return await stremio.datastore_get(conn.token, ids=changed_ids), False, started_at
 
 
@@ -5358,9 +5388,11 @@ async def _run_stremio_sync(
                 conn,
                 full_resync=full_resync,
             )
+            lookup_failures: set[str] = set()
             library_records, watched_records, progress_records, removed_ids = await _stremio_records(
                 items,
                 scrobble_threshold=scrobble_threshold_for(conn),
+                failed_ids=lookup_failures,
             )
             if not conn.sync_collection:
                 library_records = []
@@ -5434,6 +5466,14 @@ async def _run_stremio_sync(
                 if series_tmdb_map
                 else ({}, {})
             )
+            pending_ids = lookup_failures | _stremio_unresolved_ids(all_records, tmdb_ids, show_map)
+            if pending_ids:
+                logger.warning(
+                    "Stremio sync job %s: %d items could not be matched and will be retried next sync: %s",
+                    job_id,
+                    len(pending_ids),
+                    ", ".join(sorted(pending_ids)[:20]),
+                )
             all_entries = [*normalized_library, *normalized_watched, *normalized_progress]
             await db.execute(
                 update(SyncJob).where(SyncJob.id == job_id).values(total_items=len(all_entries))
@@ -5513,6 +5553,7 @@ async def _run_stremio_sync(
             # other connections; users push explicitly per-service (the "Push" buttons).
             conn.stremio_pull_cursor_at = pull_started_at
             conn.stremio_full_sync_done = True
+            conn.stremio_pending_pull_ids = sorted(pending_ids)
             warnings = await _stamp_matched_show_warnings(db, user_id, warnings)
             await db.execute(
                 update(SyncJob)
@@ -6350,20 +6391,13 @@ def _stremio_default_state() -> dict:
     }
 
 
-def _stremio_sorted_videos(meta: dict) -> list[dict]:
-    def sort_key(video: dict) -> tuple:
-        parts = _stremio_video_parts(video)
-        season, episode = parts if parts is not None else (-1, -1)
-        return season, episode, str(video.get("released") or "")
-
-    return sorted(
-        [
-            video
-            for video in (meta.get("videos") or [])
-            if isinstance(video, dict) and video.get("id")
-        ],
-        key=sort_key,
-    )
+def _stremio_videos(meta: dict) -> list[dict]:
+    # Watched bitfields index Cinemeta's array order, which lists specials last.
+    return [
+        video
+        for video in (meta.get("videos") or [])
+        if isinstance(video, dict) and video.get("id")
+    ]
 
 
 def _stremio_new_library_item(
@@ -6624,7 +6658,7 @@ async def _push_stremio_connection(
                 if is_watched and watched_at is not None:
                     state["lastWatched"] = watched_at
             else:
-                videos = _stremio_sorted_videos(series_meta.get(content_id, {}))
+                videos = _stremio_videos(series_meta.get(content_id, {}))
                 video_ids = [str(video["id"]) for video in videos]
                 watched_ids = stremio.decode_watched_bitfield(
                     state.get("watched"),
@@ -6668,7 +6702,7 @@ async def _push_stremio_connection(
             if record.get("content_type") == "movie":
                 state["video_id"] = content_id
             else:
-                videos = _stremio_sorted_videos(series_meta.get(content_id, {}))
+                videos = _stremio_videos(series_meta.get(content_id, {}))
                 matching_video = next(
                     (
                         video
