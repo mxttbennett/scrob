@@ -158,11 +158,17 @@ const isOwnStats = currentUser && String(currentUser.id) === String(id);
         <h2 class="section-headline mb-6">Most Watched</h2>
         <div class="space-y-6">
           <div class="bg-zinc-900/60 border border-zinc-800 rounded-2xl p-6" id="top-shows-card">
-            <h3 class="group-label mb-5">Most Played Shows</h3>
+            <div class="flex items-center justify-between mb-5">
+              <h3 class="group-label">Most Played Shows</h3>
+              <a href={`/stats/${id}/shows`} data-list-link={`/stats/${id}/shows`} class="text-xs font-bold text-zinc-500 hover:text-zinc-300 uppercase tracking-widest transition">View all</a>
+            </div>
             <div id="top-shows" class="grid grid-cols-3 sm:grid-cols-4 md:grid-cols-6 gap-4"></div>
           </div>
           <div class="bg-zinc-900/60 border border-zinc-800 rounded-2xl p-6" id="top-movies-card">
-            <h3 class="group-label mb-5">Most Played Movies</h3>
+            <div class="flex items-center justify-between mb-5">
+              <h3 class="group-label">Most Played Movies</h3>
+              <a href={`/stats/${id}/movies`} data-list-link={`/stats/${id}/movies`} class="text-xs font-bold text-zinc-500 hover:text-zinc-300 uppercase tracking-widest transition">View all</a>
+            </div>
             <div id="top-movies" class="grid grid-cols-3 sm:grid-cols-4 md:grid-cols-6 gap-4"></div>
           </div>
           <div class="bg-zinc-900/60 border border-zinc-800 rounded-2xl p-6" id="top-networks-card">
