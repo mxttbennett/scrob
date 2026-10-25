@@ -190,7 +190,6 @@ export function renderStats(data, since, until) {
     }
   }
 
-  // Rating distribution
   renderBreakdownCharts(data);
   renderTopStats(data);
 } // end renderStats
