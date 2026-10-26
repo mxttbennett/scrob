@@ -12,21 +12,10 @@ from models.events import WatchEvent
 from models.media import Media
 from models.show import Show as ShowModel
 from models.users import User
+from core.watch_stats import effective_runtime_expression
 from .common import _check_profile_access
 
 router = APIRouter()
-
-
-def _effective_runtime():
-    from sqlalchemy import Integer as SAInteger
-    from sqlalchemy.types import Text as SAText
-    # Episodes store runtime in tmdb_data['runtime']; movies use Media.runtime.
-    # JSON (non-JSONB) has no .astext; cast to Text first, guard against JSON "null".
-    json_runtime = func.cast(
-        func.nullif(func.cast(Media.tmdb_data["runtime"], SAText), "null"),
-        SAInteger,
-    )
-    return func.coalesce(Media.runtime, json_runtime)
 
 
 def _watch_date_filters(since: Optional[DateType], until: Optional[DateType]) -> list:
@@ -67,7 +56,7 @@ def _rank_top_media(top_rows, show_meta: dict[int, dict]) -> tuple[list[dict], l
 
 
 async def _top_media(db: AsyncSession, user_id: int, date_filters: list) -> tuple[list[dict], list[dict]]:
-    effective_runtime = _effective_runtime()
+    effective_runtime = effective_runtime_expression()
     top_rows = (await db.execute(
         select(
             Media.media_type, Media.id, Media.title, Media.poster_path,
