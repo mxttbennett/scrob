@@ -1,3 +1,8 @@
+# Versioning
+
+- Every Scrob change intended to ship must produce a version bump. Use a release-triggering Conventional Commit PR title: `fix` for a patch, `feat` for a minor release, or `BREAKING CHANGE` for a major release. semantic-release publishes the new app version after merge to `main`.
+- Do not manually change `APP_VERSION`, `frontend/package.json`, or `backend/pyproject.toml` for an app release. Confirm the GitHub Release was published before expecting Streamstack to deploy it.
+
 # Deployment to feed1-prod
 
 - The `mxttbennett/scrob` fork is deployed by `mxttbennett/streamstack` to the separate Compose project in `/opt/scrob`.
