@@ -170,6 +170,7 @@ export interface Season {
   season_number: number;
   play_count: number;
   watch_time_minutes: number;
+  last_watched_at?: string | null;
   episode_order?: string;
   show_watched: boolean;
   season_watched: boolean;
@@ -957,6 +958,7 @@ export interface TvdbSeason {
   episodes: TvdbEpisode[];
   play_count: number;
   watch_time_minutes: number;
+  last_watched_at?: string | null;
   season_in_library: boolean;
   season_watch_pct: number;
   season_watch_started?: boolean;
@@ -1034,6 +1036,7 @@ export interface TvdbShow {
   user_rating: number | null;
   play_count: number;
   watch_time_minutes: number;
+  last_watched_at?: string | null;
   season_states: Record<number, SeasonState>;
   where_to_watch: { type: string; name: string; logo: string | null }[];
   rewatch?: ShowRewatch | null;
@@ -1084,6 +1087,7 @@ export interface Show {
   user_rating?: number | null;
   play_count?: number;
   watch_time_minutes?: number;
+  last_watched_at?: string | null;
   first_air_date: string | null;
   last_air_date: string | null;
   where_to_watch?: { type: string; name: string; logo: string | null }[];

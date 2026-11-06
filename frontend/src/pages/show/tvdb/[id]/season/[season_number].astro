@@ -176,7 +176,7 @@ const viewerTz = getViewerTimeZone(Astro.cookies);
                 />
               </div>
             )}
-            {user && <WatchStats plays={season.play_count} watchTimeMinutes={season.watch_time_minutes} />}
+            {user && <WatchStats plays={season.play_count} watchTimeMinutes={season.watch_time_minutes} lastWatchedAt={season.last_watched_at} timeZone={viewerTz} />}
 
             {user && season.show_in_library && (
               <div class="mb-6">
