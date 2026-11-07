@@ -1,5 +1,4 @@
 ---
-import { formatWatchedOn } from "../../../../../lib/media-format";
 import { getViewerTimeZone } from "../../../../../lib/viewerTimeZone";
 import Base from "../../../../../layouts/Base.astro";
 import ActionBar from "../../../../../components/ActionBar.astro";
@@ -38,7 +37,6 @@ const apiSeason = episode?.canonical_season_number ?? Number(season_number);
 const apiEpisode = episode?.canonical_episode_number ?? Number(episode_number);
 const rating = episode?.tmdb_rating ? episode.tmdb_rating.toFixed(1) : null;
 const thumbnail = episode?.still_path || show?.poster_path || null;
-const lastWatchedLabel = formatWatchedOn(episode?.last_watched_at, getViewerTimeZone(Astro.cookies));
 ---
 
 <Base title={episode ? `${show?.title} - ${episode.title}` : "Episode Details"}>
@@ -178,7 +176,6 @@ const lastWatchedLabel = formatWatchedOn(episode?.last_watched_at, getViewerTime
 
             {user && (
               <div class="mb-4">
-                {lastWatchedLabel && <p class="mb-2 text-xs font-bold text-zinc-500">{lastWatchedLabel}</p>}
                 <ActionBar
                   tmdbId={episode.tmdb_id}
                   mediaType="episode"
@@ -199,7 +196,7 @@ const lastWatchedLabel = formatWatchedOn(episode?.last_watched_at, getViewerTime
               </div>
             )}
 
-            {user && <WatchStats plays={episode.play_count} watchTimeMinutes={episode.watch_time_minutes} />}
+            {user && <WatchStats plays={episode.play_count} watchTimeMinutes={episode.watch_time_minutes} lastWatchedAt={episode.last_watched_at} timeZone={getViewerTimeZone(Astro.cookies)} />}
 
             {user && (
               <ManualScrobble
