@@ -41,6 +41,7 @@ Scrob syncs your libraries from **Jellyfin**, **Plex**, **Emby**, **Nuvio**, **A
   - [Scheduling, Full Resync, and Limitations](#scheduling-full-resync-and-limitations)
 - [Simkl Synchronization](#simkl-synchronization)
 - [MDBList Synchronization](#mdblist-synchronization)
+- [Watchlist](#watchlist)
 - [Webhooks](#webhooks-real-time-scrobbling)
   - [Jellyfin](#jellyfin)
   - [Plex](#plex)
@@ -66,6 +67,7 @@ Scrob syncs your libraries from **Jellyfin**, **Plex**, **Emby**, **Nuvio**, **A
 - **Watch history & ratings**: Track every movie and episode you've watched, including multiple plays with individual timestamps. Log plays manually with a custom date, or remove individual entries - all from the watched button on any movie or episode page. Rate them on a 10-point scale with optional reviews.
 - **Season ratings**: Rate individual seasons separately from the overall show.
 - **Rewatches**: Start a rewatch on any show and Scrob tracks progress for that cycle separately, without touching your original watch history.
+- **Watchlist**: One watchlist that Plex, Trakt, MDBList and Simkl all sync with, so a title added on any of them shows up once and reaches the others. See [Watchlist](#watchlist).
 - **Personal lists**: Create and curate lists of movies and shows. Mark them public to share with other users on the same instance.
 - **Comments**: Leave comments on movies, shows, seasons, and episodes.
 - **Social**: Follow other users and see their activity.
@@ -518,7 +520,7 @@ Scrob signs in with Simkl's AUTH V2 device flow through its own Simkl app, and r
 |---|---|---|
 | Simkl → Scrob | **Watched history** | Imports watched movies and episodes. |
 | Simkl → Scrob | **Ratings** | Imports ratings. |
-| Simkl → Scrob | **Lists / Watchlist** | Imports "plan to watch" items into a managed **Simkl - Watchlist** list. |
+| Simkl → Scrob | **Lists / Watchlist** | Syncs "plan to watch" items into the [Watchlist](#watchlist): new ones are added, ones removed on Simkl are removed. |
 | Simkl → Scrob | **Dropped shows** | Marks shows you dropped on Simkl as dropped in Scrob. Only shows Scrob already knows are marked, and a show un-dropped on Simkl is not un-dropped in Scrob. Off by default. |
 | Scrob → Simkl | **Watched status** | Pushes watched and unwatched changes made in Scrob or imported from another connected provider. |
 | Scrob → Simkl | **Ratings** | Pushes rating changes. |
@@ -534,11 +536,34 @@ The manual **Push** action sends the complete enabled watched-history and rating
 1. Open **Connections → Media Trackers → MDBList**.
 2. Copy the API key from [MDBList Preferences](https://mdblist.com/preferences), paste it into Scrob, and select **Save Changes**.
 3. Choose the data to import under **MDBList → Scrob**, then select **Pull**. MDBList pulls run only when this button is selected.
-4. To send changes back, enable the required **Scrob → MDBList** options. Watched-state and rating edits are pushed as they happen; edits to the managed **MDBList - Watchlist** are pushed to the MDBList watchlist.
+4. To send changes back, enable the required **Scrob → MDBList** options. Watched-state and rating edits are pushed as they happen; edits to the [Watchlist](#watchlist) are pushed to the MDBList watchlist.
 
-The manual **Push** action sends the complete enabled watched, ratings, or managed-watchlist snapshot. MDBList pagination follows `next_cursor` and requests the documented maximum of 1,000 items per page.
+The manual **Push** action sends the complete enabled watched or ratings snapshot and reconciles the watchlist. MDBList pagination follows `next_cursor` and requests the documented maximum of 1,000 items per page.
 
 **Auto Pull** and **Auto Push** can run independently every 15 minutes, 30 minutes, 1 hour, 3 hours, 6 hours, 12 hours, 24 hours, or 48 hours.
+
+## Watchlist
+
+Every user has one **Watchlist**, shown first under **Lists**. It can't be deleted. Plex, Trakt, MDBList and Simkl all sync their watchlist with it, instead of each filling a list of its own, so Scrob works as the hub between them:
+
+- A title added on one service lands on the Watchlist once, and goes out to every other service with watchlist push enabled on its next sync.
+- A title removed on a service is removed from the Watchlist, and then from the other services with push enabled.
+- A title added or removed in Scrob is pushed to those services right away.
+
+Each service remembers what its watchlist looked like after its last sync, so it can tell a removal from a title that was never there. A service that only pulls (Simkl, or any service with push off) adds and removes only what changed on that service, and never removes titles that came from somewhere else. A sync that would remove more than half of a watchlist of 10 or more titles is skipped as a probably broken fetch.
+
+| Service | Pull setting | Push setting |
+|---|---|---|
+| Plex | **Watchlist** under the connection's import options | **Watchlist** under its push options |
+| Trakt | **Lists** | **Lists** |
+| MDBList | **Watchlist** | **Watchlist** |
+| Simkl | **Lists / Watchlist** | none (Simkl has no watchlist push) |
+
+Only whole movies and shows take part. Seasons added to the Watchlist stay in Scrob.
+
+API clients use `GET /api/proxy/lists/watchlist` to get the Watchlist's id, then the usual `/api/proxy/lists/{id}/items` endpoints.
+
+When upgrading from a version with per-service lists, the "Trakt - Watchlist", "Plex - Watchlist", "MDBList - Watchlist" and "Simkl - Watchlist" lists are merged into the Watchlist, without duplicates. The old lists are kept, renamed with "(old)", and no longer sync. Delete them once you've checked the Watchlist. The first sync of each service after the upgrade only adds titles and never removes any.
 
 ## Webhooks (Real-time Scrobbling)
 
@@ -570,6 +595,16 @@ Plex webhooks require a **Plex Pass** subscription.
 1. Go to [plex.tv/account](https://www.plex.tv/account/) → **Webhooks → Add Webhook**.
 2. Paste your Scrob Plex webhook URL.
 3. In Scrob → Connections, enter your **Plex username** so events are attributed to the right account.
+
+#### Playback progress to Plex
+
+Turn on **Scrob → Plex → Playback progress** on a Plex connection to send Scrob's Continue Watching to Plex, so a movie or episode you stopped part way on another player (Kodi, Jellyfin, Emby, or an app using Scrob's player webhook) shows as in progress in Plex and resumes there.
+
+- **Push** and **Auto Push** write every resume point to Plex, looking titles up in the Plex libraries when Scrob hasn't seen them on that server yet. Auto Push skips positions it already sent.
+- A stop from a player other than Plex is sent right away, without waiting for Auto Push, for titles Scrob has already seen on that Plex server. Others follow on the next push.
+- Scrob never moves Plex backwards: a title Plex played more recently than Scrob recorded its position is left alone.
+
+Like the other Plex pushes, this uses the connection's token, so it sets the resume point of the Plex account that token belongs to.
 
 ### Emby
 
@@ -724,6 +759,26 @@ npm run dev
 ```
 
 The frontend dev server starts on `http://localhost:4321` and proxies API calls to the backend on `7331`.
+
+### UI text and translations
+
+User-facing text lives in message catalogs in `frontend/messages/`, compiled by [Paraglide JS](https://inlang.com/m/gerre34r/library-inlang-paraglideJs). New text goes into `en.json`; the other catalogs hold its translations, and a string missing from one shows in English.
+
+1. Add a key to `frontend/messages/en.json`, prefixed with the page or area (`history_empty`). Reuse a `common_*` key when one fits.
+2. Call it in frontmatter or in a `<script>`: `import { m } from "../paraglide/messages.js"`, then `m.history_empty()`, or `m.episodes_left({ count })` with parameters. A key that doesn't exist fails `npm run build`.
+3. Format dates and numbers with the helpers in `frontend/src/lib/format.ts` (`formatDate`, `formatNumber`, ...) rather than `toLocaleString()`, so they follow the UI language and the viewer's region.
+
+In VS Code, the [Sherlock](https://marketplace.visualstudio.com/items?itemName=inlang.vs-code-extension) extension shows each message's English text next to its `m.*()` call, and extracts selected text into a new key.
+
+Plurals use the variant format (see `episodes_left` in `en.json`), with a `=*` catch-all. A message rendered with `set:html` may contain markup: pass every interpolated value through `escapeHtml` from `format.ts`.
+
+#### Adding a language
+
+1. Add its code to `locales` in `frontend/project.inlang/settings.json`, for example `["en", "fr", "de"]`. A regional variant is a tag such as `pt-PT` (European Portuguese, shipped); the file is then `pt-PT.json`.
+2. Create `frontend/messages/<code>.json` (copy `en.json` as a starting point) and translate the values. A key left out shows in English, so a partial translation works.
+3. Rebuild the frontend (restart the dev server if it is running).
+
+The language shows up in the pickers (Settings and the signed-out pages) on its own: English comes first, the rest follow in order of language code, and each is labelled in its own language ("Deutsch", "Français"), generated from the browser's built-in language data. The backend needs no change: it only checks that a saved code looks like a language code, and a code that isn't shipped falls back to English. English is the default, so a user only sees another language after picking it.
 
 </details>
 

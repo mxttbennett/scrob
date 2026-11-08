@@ -6,7 +6,6 @@ from datetime import date as DateType, timedelta as TimeDelta
 from typing import Optional
 from db import get_db
 from core.credits import credits_stats, maybe_backfill_credits
-from core.watch_stats import effective_runtime_expression
 from dependencies import get_optional_user_or_api_key
 from models.users import User
 from models.events import WatchEvent
@@ -16,6 +15,7 @@ from models.ratings import Rating
 from models.show import Show as ShowModel
 
 from .common import _check_profile_access
+from core.media_runtime import effective_runtime_expression
 from .top_media import _top_media, _watch_date_filters
 
 
@@ -306,7 +306,7 @@ async def get_user_stats(
     if current_user and current_user.id == user_id:
         await maybe_backfill_credits(db, user_id)
 
-    top_shows, top_movies = await _top_media(db, user_id, date_filters)
+    top_shows, top_movies = await _top_media(db, user_id, date_filters, limit=12)
     # Networks come from the same instance-wide TMDB credits cache as the people
     # stats below (core/credits.py) - it already fetches a full show response per
     # watched title, so this reuses that instead of relying on Show.tmdb_data
@@ -340,8 +340,8 @@ async def get_user_stats(
         "shows_watched_collected": shows_watched_collected,
         "shows_unwatched_collected": max(shows_collected - shows_watched_collected, 0),
         # Top titles & people (#124)
-        "top_shows": top_shows[:12],
-        "top_movies": top_movies[:12],
+        "top_shows": top_shows,
+        "top_movies": top_movies,
         "top_networks": top_networks,
         "top_people": top_people,
     }

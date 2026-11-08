@@ -5,7 +5,8 @@ from datetime import date, datetime, timedelta, timezone
 from typing import Any
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import and_, or_, select, desc, func, delete, case
+from sqlalchemy import Integer, and_, bindparam, case, column, delete, desc, func, or_, select, tuple_
+from sqlalchemy.dialects.postgresql import ARRAY
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import selectinload, aliased
 from db import get_db, AsyncSessionLocal
@@ -26,7 +27,8 @@ from core.episode_order import get_order_keys_for_series, get_positions_for_seri
 from core.scrobble_threshold import DEFAULT_SCROBBLE_PERCENT
 from core.translations import get_user_metadata_language, get_media_translations, upsert_media_translation, apply_media_translations, get_show_translations
 from core.rewatch import get_active_rewatch, record_rewatch_progress, get_already_watched_for_bulk_mark, capped_season_episode_counts
-from core.watch_dedup import get_dedup_window_minutes, find_duplicate_watch_event
+from core.media_runtime import effective_runtime_expression
+from core.watch_dedup import get_dedup_window_minutes, find_duplicate_watch_event, expand_to_same_episode_media_ids
 from core.enrichment import create_media_safely
 from core.episode_order import get_episode_orders_for_series, get_tmdb_to_tvdb_positions
 
@@ -905,6 +907,78 @@ def _attach_show_last_watched(items: list[dict], last_watched_at: dict[int, date
         item["last_watched_at"] = show_last_watched_at.isoformat() if show_last_watched_at else None
 
 
+def _last_watched_per_show_stmt(watch_filters: list, by_recent: bool = False):
+    """One row per show, computed in the database: the show's position
+    (season, episode) and its most recent watched_at (a window max over the
+    show's qualifying events). Rows with an unknown season or episode are left
+    out up front, the way _group_last_watched leaves them out.
+
+    By default the position is the furthest watched episode. With by_recent it
+    is the most recently watched one (the furthest among ties, or when nothing
+    is timestamped, because NULL watched_at sorts last)."""
+    ordering = [Media.show_id]
+    if by_recent:
+        ordering.append(WatchEvent.watched_at.desc().nulls_last())
+    ordering += [desc(Media.season_number), desc(Media.episode_number)]
+    return (
+        select(
+            Media.show_id,
+            Media.season_number,
+            Media.episode_number,
+            func.max(WatchEvent.watched_at).over(partition_by=Media.show_id),
+        )
+        .join(WatchEvent, WatchEvent.media_id == Media.id)
+        .where(*watch_filters, Media.season_number.isnot(None), Media.episode_number.isnot(None))
+        .distinct(Media.show_id)
+        .order_by(*ordering)
+    )
+
+
+def _next_episode_candidates_stmt(last_per_show: dict[int, tuple[int, int]]):
+    """The immediately next episode of each show, as one statement.
+
+    `last_per_show` maps a show id to its furthest watched (season, episode). The
+    positions travel as three array parameters joined through unnest(), so the
+    statement has the same shape however many shows there are (no per-show OR
+    branch to build, cache and plan, and no bind parameter per show), and
+    DISTINCT ON returns the one next row per show rather than every later
+    episode. Media.id only settles a tie between two rows for the same episode.
+    """
+    show_ids = list(last_per_show)
+    positions = (
+        func.unnest(
+            bindparam("pos_show", show_ids, type_=ARRAY(Integer)),
+            bindparam("pos_season", [last_per_show[i][0] for i in show_ids], type_=ARRAY(Integer)),
+            bindparam("pos_episode", [last_per_show[i][1] for i in show_ids], type_=ARRAY(Integer)),
+        )
+        .table_valued(column("show_id", Integer), column("season", Integer), column("episode", Integer))
+        .render_derived(name="pos")
+    )
+    return (
+        select(Media)
+        .options(selectinload(Media.show))
+        .join(
+            positions,
+            and_(
+                Media.show_id == positions.c.show_id,
+                tuple_(Media.season_number, Media.episode_number) > tuple_(positions.c.season, positions.c.episode),
+            ),
+        )
+        .where(
+            Media.media_type == MediaType.episode,
+            # Exclude phantom placeholder rows (imported watch/rating history for
+            # an episode number TMDB doesn't actually have, e.g. a provider
+            # numbering mismatch) — they have no real metadata and would surface
+            # a broken Next Up card that 404s when opened.
+            # A TVDB-only episode carries its TVDB episode id instead of a
+            # TMDB one, and is just as real.
+            or_(Media.tmdb_id.isnot(None), Media.tvdb_id.isnot(None)),
+        )
+        .distinct(Media.show_id)
+        .order_by(Media.show_id, Media.season_number, Media.episode_number, Media.id)
+    )
+
+
 def _has_aired(release_date: str | None, today: date) -> bool:
     """True if release_date (ISO 8601, e.g. from TMDB air_date) is on or before
     today, or unknown. ISO 8601 strings sort lexicographically the same as their
@@ -1060,15 +1134,8 @@ async def _next_up_remaining_stats(
 
     # Average effective runtime per show — same coalesce as profile.py's watch
     # time stats: episodes often only carry runtime in tmdb_data['runtime'].
-    from sqlalchemy import Integer as SAInteger
-    from sqlalchemy.types import Text as SAText
-
-    json_runtime = func.cast(
-        func.nullif(func.cast(Media.tmdb_data["runtime"], SAText), "null"),
-        SAInteger,
-    )
     avg_rows = await db.execute(
-        select(Media.show_id, func.avg(func.coalesce(Media.runtime, json_runtime)))
+        select(Media.show_id, func.avg(effective_runtime_expression()))
         .where(
             Media.show_id.in_(list(shows_by_id)),
             Media.media_type == MediaType.episode,
@@ -1238,16 +1305,13 @@ async def get_next_up(
     ]
     if active_rewatch_show_ids:
         watch_filters.append(Media.show_id.notin_(active_rewatch_show_ids))
-    result = await db.execute(
-        select(Media.show_id, Media.season_number, Media.episode_number, WatchEvent.watched_at)
-        .join(WatchEvent, WatchEvent.media_id == Media.id)
-        .where(*watch_filters)
-        .order_by(Media.show_id, desc(Media.season_number), desc(Media.episode_number))
-    )
-    rows = result.all()
-
-    # Keep only the furthest episode per show, and the most recent watched_at per show.
-    last_per_show, last_watched_at = _group_last_watched(rows, by_recent=by_recent)
+    result = await db.execute(_last_watched_per_show_stmt(watch_filters, by_recent))
+    last_per_show: dict[int, tuple[int, int]] = {}
+    last_watched_at: dict[int, datetime] = {}
+    for show_id, season, episode, latest in result.all():
+        last_per_show[show_id] = (season, episode)
+        if latest:
+            last_watched_at[show_id] = latest
 
     # Step 1b: Rewatching shows - candidate position comes from that rewatch's
     # progress (furthest re-watched episode so far), defaulting to "before
@@ -1273,34 +1337,8 @@ async def get_next_up(
     if not last_per_show:
         return {"next_up": []}
 
-    # Step 2: Candidate next episodes (anything after the last watched one, per show)
-    show_filters = [
-        and_(
-            Media.show_id == show_id,
-            or_(
-                Media.season_number > season,
-                and_(Media.season_number == season, Media.episode_number > episode),
-            ),
-        )
-        for show_id, (season, episode) in last_per_show.items()
-    ]
-
-    candidates_result = await db.execute(
-        select(Media)
-        .options(selectinload(Media.show))
-        .where(
-            Media.media_type == MediaType.episode,
-            # Exclude phantom placeholder rows (imported watch/rating history for
-            # an episode number TMDB doesn't actually have, e.g. a provider
-            # numbering mismatch) — they have no real metadata and would surface
-            # a broken Next Up card that 404s when opened.
-            # A TVDB-only episode carries its TVDB episode id instead of a
-            # TMDB one, and is just as real.
-            or_(Media.tmdb_id.isnot(None), Media.tvdb_id.isnot(None)),
-            or_(*show_filters),
-        )
-        .order_by(Media.show_id, Media.season_number, Media.episode_number)
-    )
+    # Step 2: the immediately next episode per show, picked in the database.
+    candidates_result = await db.execute(_next_episode_candidates_stmt(last_per_show))
     candidates = candidates_result.scalars().all()
 
     # Take only the immediately next episode per show
@@ -1818,7 +1856,7 @@ async def _simkl_status_for_undropped_show(db: AsyncSession, user_id: int, tmdb_
     - completed: the show has ended and every aired episode is watched;
     - watching: at least one episode watched;
     - hold: nothing watched. Not plantowatch, which Scrob would pull into the
-      "Simkl - Watchlist"; not watching, which claims a show was started.
+      watchlist; not watching, which claims a show was started.
     """
     show = (await db.execute(select(Show).where(Show.tmdb_id == tmdb_id))).scalar_one_or_none()
     if not show:
@@ -2610,13 +2648,37 @@ async def get_item_events(
         id_clause = Media.tmdb_id == tmdb_id
     else:
         id_clause = Media.tvdb_id == tvdb_id
+    # An episode can exist as several Media rows (a webhook and a Trakt import
+    # resolving it differently, #527); show the plays of all of them, not just
+    # the row this particular id happens to point at. One statement, so no
+    # extra round trip: also match any episode row sharing the anchor's
+    # show/season/episode.
+    event_media_clause = id_clause
+    if media_type == MediaType.episode:
+        anchor = aliased(Media)
+        if media_id:
+            anchor_clause = anchor.id == media_id
+        elif tmdb_id:
+            anchor_clause = anchor.tmdb_id == tmdb_id
+        else:
+            anchor_clause = anchor.tvdb_id == tvdb_id
+        siblings = (
+            select(Media.id)
+            .join(anchor, and_(
+                Media.show_id == anchor.show_id,
+                Media.season_number == anchor.season_number,
+                Media.episode_number == anchor.episode_number,
+            ))
+            .where(anchor_clause, anchor.media_type == MediaType.episode, Media.media_type == MediaType.episode)
+        )
+        event_media_clause = or_(id_clause, Media.id.in_(siblings))
     query = (
         select(WatchEvent, Media.id)
         .join(Media, Media.id == WatchEvent.media_id)
         .where(
             WatchEvent.user_id == current_user.id,
             WatchEvent.completed == True,
-            id_clause,
+            event_media_clause,
             Media.media_type == media_type,
         )
         .order_by(WatchEvent.watched_at.desc().nulls_last(), WatchEvent.id.desc())
@@ -2782,10 +2844,12 @@ async def unwatch_item(
     media = await find_media(db, media_type, media_id=media_id, tmdb_id=tmdb_id, tvdb_id=tvdb_id)
     if not media:
         return {"status": "ok", "count": 0}
+    # Clear the plays of every Media row for this episode, otherwise a sibling
+    # row's plays (#527) would keep it looking watched.
     await db.execute(
         delete(WatchEvent).where(
             WatchEvent.user_id == current_user.id,
-            WatchEvent.media_id == media.id,
+            WatchEvent.media_id.in_(await expand_to_same_episode_media_ids(db, [media.id])),
         )
     )
     await db.commit()

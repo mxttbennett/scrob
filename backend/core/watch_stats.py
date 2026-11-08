@@ -2,19 +2,10 @@ from typing import NamedTuple
 
 from sqlalchemy import case, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.types import Integer as SAInteger, Text as SAText
 
+from core.media_runtime import effective_runtime_expression
 from models.events import WatchEvent
 from models.media import Media
-
-
-# PostgreSQL JSON needs a text cast, and JSON null must be cleared before the integer cast.
-def effective_runtime_expression():
-    json_runtime = func.cast(
-        func.nullif(func.cast(Media.tmdb_data["runtime"], SAText), "null"),
-        SAInteger,
-    )
-    return func.coalesce(Media.runtime, json_runtime)
 
 
 class WatchStats(NamedTuple):
@@ -39,7 +30,10 @@ async def get_watch_stats(
     )
     last_watched_at = func.max(case((WatchEvent.completed == True, WatchEvent.watched_at)))
     query = (
-        select(func.count(WatchEvent.id), watch_time, last_watched_at)
+        # A play is a completed watch: in-progress rows (a Jellyfin/Emby pull
+        # stores them with completed=False) are not plays, the same as for
+        # watch time and the last watched date.
+        select(func.count(case((WatchEvent.completed == True, WatchEvent.id))), watch_time, last_watched_at)
         .select_from(Media)
         .join(WatchEvent, WatchEvent.media_id == Media.id)
         .where(WatchEvent.user_id == user_id)
