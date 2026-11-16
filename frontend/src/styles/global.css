@@ -287,7 +287,7 @@ html.light [data-action="drop"][data-state="active"]:hover {
    logos stay legible regardless of theme. Less translucent in dark mode,
    where the near-black page behind it would otherwise wash the white toward
    gray and undo the contrast it's there for. */
-.logo-swatch { background-color: rgba(255, 255, 255, 0.85); }
+.logo-swatch { background-color: rgb(107, 114, 128); }
 html.light .logo-swatch { background-color: rgba(255, 255, 255, 0.6); }
 
 html.light .item-rating { color: #fbbf24; /* amber-400 */ }
